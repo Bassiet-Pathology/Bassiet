@@ -625,7 +625,7 @@ function lookPanel(){
   var L=CT.look;
   function seg(k,opts,cur){return '<span class="seg" role="group">'+opts.map(function(o){return '<button data-act="look" data-k="'+k+'" data-v="'+o[0]+'" aria-pressed="'+((cur!=null?cur:L[k])===o[0])+'">'+o[1]+'</button>'}).join('')+'</span>'}
   var wv=L.world==='dive'?'dive':L.theme==='light'?'light':'auto';
-  return '<h3 id="look-h">Look and sound</h3><div class="panel look" id="look"><div class="frow"><span>World</span>'+seg('world',[['dive','The dive'],['light','Lights on'],['auto','Follow device']],wv)+'</div><div class="frow"><span>Text</span>'+seg('size',[['s','Small'],['n','Normal'],['l','Large']])+'</div><div class="frow"><span>Motion</span>'+seg('motion',[['on','On'],['off','Off']])+'</div><div class="frow"><span>Sound</span>'+seg('sound',[['off','Off'],['on','On']])+'</div><div class="frow"><span>Duel clock</span>'+seg('timer',[['40','40 s'],['80','80 s'],['off','Off']])+'</div><div class="frow"><span>Week starts</span>'+seg('week',[['sun','Sunday'],['mon','Monday']])+'</div><div class="frow"><span>Shortcuts</span>'+seg('keys',[['on','On'],['off','Off']])+'</div></div>';
+  return '<h3 id="look-h">Look and sound</h3><div class="panel look" id="look"><div class="frow"><span>World</span>'+seg('world',[['dive','The dive'],['light','Lights on'],['auto','Follow device']],wv)+'</div><div class="frow"><span>Text</span>'+seg('size',[['s','Small'],['n','Normal'],['l','Large']])+'</div><div class="frow"><span>Motion</span>'+seg('motion',[['on','On'],['off','Off']])+'</div><div class="frow"><span>Sound effects</span>'+seg('sound',[['off','Off'],['on','On']])+'</div><div class="frow"><span>Duel clock</span>'+seg('timer',[['40','40 s'],['80','80 s'],['off','Off']])+'</div><div class="frow"><span>Week starts</span>'+seg('week',[['sun','Sunday'],['mon','Monday']])+'</div><div class="frow"><span>Shortcuts</span>'+seg('keys',[['on','On'],['off','Off']])+'</div></div>';
 }
 
 /* ---------- hooks ---------- */
@@ -767,33 +767,19 @@ A.look=function(el){var k=el.dataset.k,v=el.dataset.v;
 
 /* ---------- sound: WebAudio only, no files ---------- */
 var SND=(function(){
-  var ac=null,master=null,amb=null,beatT=0,mood='';
+  var ac=null,master=null;   /* the ambient drone and heartbeat were removed (18/11/2026); only short effects remain */
   function on(){return CT.look.sound==='on'}
   function ensure(){if(ac)return true;try{ac=new (window.AudioContext||window.webkitAudioContext)();master=ac.createGain();master.gain.value=.5;master.connect(ac.destination);return true}catch(e){return false}}
-  function live(){return ac&&ac.state==='running'&&!document.hidden}
   function tone(f,d,type,g,slide){if(!on()||!ensure()||document.hidden)return;var o=ac.createOscillator(),v=ac.createGain(),t=ac.currentTime;o.type=type||'sine';o.frequency.setValueAtTime(f,t);if(slide)o.frequency.exponentialRampToValueAtTime(slide,t+d);v.gain.setValueAtTime(g||.2,t);v.gain.exponentialRampToValueAtTime(.0001,t+d);o.connect(v);v.connect(master);o.start(t);o.stop(t+d+.02)}
   function noise(d,g,lo,hi){if(!on()||!ensure()||document.hidden)return;var n=ac.sampleRate*d,b=ac.createBuffer(1,n,ac.sampleRate),x=b.getChannelData(0);for(var i=0;i<n;i++)x[i]=(Math.random()*2-1)*(1-i/n);var s=ac.createBufferSource(),f=ac.createBiquadFilter(),v=ac.createGain();s.buffer=b;f.type='bandpass';f.frequency.value=(lo+hi)/2;f.Q.value=.8;v.gain.value=g;s.connect(f);f.connect(v);v.connect(master);s.start()}
-  function startAmb(){
-    if(amb||!on()||!ensure())return;
-    var g=ac.createGain();g.gain.value=0;g.gain.linearRampToValueAtTime(.12,ac.currentTime+3);
-    var lp=ac.createBiquadFilter();lp.type='lowpass';lp.frequency.value=260;
-    var o1=ac.createOscillator(),o2=ac.createOscillator(),lfo=ac.createOscillator(),lg=ac.createGain();
-    o1.type='sawtooth';o1.frequency.value=41;o2.type='sawtooth';o2.frequency.value=41.6;lfo.frequency.value=.07;lg.gain.value=120;
-    lfo.connect(lg);lg.connect(lp.frequency);o1.connect(lp);o2.connect(lp);lp.connect(g);g.connect(master);o1.start();o2.start();lfo.start();
-    amb={g:g,o:[o1,o2,lfo]};
-    beat();
-  }
-  /* no beats are queued while hidden or suspended, so nothing stacks up on return (t10-11) */
-  function beat(){clearTimeout(beatT);if(!amb)return;var fast=mood==='duel';if(!live()){beatT=setTimeout(beat,1150);return}tone(52,.18,'sine',.5,38);setTimeout(function(){if(live())tone(46,.16,'sine',.35,34)},fast?180:240);beatT=setTimeout(beat,fast?620:1150)}
-  function stopAmb(){if(!amb)return;var a=amb;amb=null;clearTimeout(beatT);try{a.g.gain.linearRampToValueAtTime(0,ac.currentTime+.6);setTimeout(function(){a.o.forEach(function(o){try{o.stop()}catch(e){}})},700)}catch(e){}}
   document.addEventListener('visibilitychange',function(){if(!ac)return;if(document.hidden)ac.suspend();else if(on())ac.resume()});
-  document.addEventListener('pointerdown',function(){if(on()){ensure();if(ac.state==='suspended')ac.resume();startAmb()}},true);
+  document.addEventListener('pointerdown',function(){if(on()&&ensure()&&ac.state==='suspended')ac.resume()},true);
   return {
-    toggle:function(){if(on()){ensure();if(ac.state==='suspended')ac.resume();startAmb()}else stopAmb()},
+    toggle:function(){if(on()&&ensure()&&ac.state==='suspended')ac.resume()},
     good:function(){tone(660,.12,'square',.06);setTimeout(function(){tone(990,.14,'square',.05)},90)},
     bad:function(){tone(110,.35,'sawtooth',.12,70)},
     static:function(){noise(.45,.18,800,3200)},
-    mood:function(s){mood=/^duel-/.test(s)?'duel':''}
+    mood:function(){}
   };
 })();
 
