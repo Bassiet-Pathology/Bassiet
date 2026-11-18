@@ -138,12 +138,12 @@ export function signInRedirect({ renew = false } = {}) {
 }
 
 /** On start-up: if Google just sent us back, keep the token and tidy the address. → null | {ok:true} | {ok:false, message} */
-export async function takeRedirect() {
-  const h = location.hash || '';
+export async function takeRedirect(given) {
+  const h = given || location.hash || '';
   if (!/[#&](access_token|error)=/.test(h)) return null;
   const r = Object.fromEntries(new URLSearchParams(h.slice(1)));
   let back = null; try { back = JSON.parse(localStorage.getItem(BACK_KEY) || 'null'); localStorage.removeItem(BACK_KEY); } catch {}
-  history.replaceState(null, '', location.pathname + location.search + (back?.hash && !/access_token|error=/.test(back.hash) ? back.hash : '#more'));
+  history.replaceState(null, '', location.pathname + location.search + (back?.hash && !/access_token|error=/.test(back.hash) ? back.hash : '#today'));
   if (!back || back.state !== r.state) { auth.lastEvent = 'redirect: state mismatch'; return { ok: false, message: 'That Google answer was not for this sign-in. Tap Sign in again.' }; }
   if (r.error) { auth.lastEvent = `redirect: ${r.error}`; auth.lastError = r.error; return { ok: false, message: r.error === 'access_denied' ? 'Google sign-in was cancelled.' : `Google sign-in: ${r.error}` }; }
   if (!String(r.scope || '').split(/\s+/).includes('https://www.googleapis.com/auth/drive')) { auth.lastEvent = 'redirect: no drive'; auth.lastError = 'Drive was not allowed'; return { ok: false, message: 'Google signed you in but did not allow Drive. Sign in again and tick the box for Google Drive.' }; }

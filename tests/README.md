@@ -11,4 +11,4 @@ Release gate (all must pass):
 - `node tests/figall.js` — every figure renders and every button works
 - `node tests/drivetest.js` — Drive folder resolution against a fake Drive
 Extra: s8.js (re-stain, losing duel; its duel step predates the new Depth 1 metabolism stratum), s9.js (Atlas/Practice), figshot.js <ids> (renders figures to figs.png), final.js (phone/desktop screenshots).
-- `node tests/webmode.js` and `node tests/cloud.mjs` — website mode (serve docs/ first: `python3 -m http.server 8765 --directory docs`): device storage survives reload; two devices sync through a fake Google Drive (fake-google.mjs from Sudachi)
+- `node tests/webmode.js`, `node tests/cloud.mjs` and `node tests/redirect.mjs` — website mode (serve docs/ first: `python3 -m http.server 8765 --directory docs`): device storage survives reload; two devices sync through a fake Google Drive (fake-google.mjs from Sudachi)

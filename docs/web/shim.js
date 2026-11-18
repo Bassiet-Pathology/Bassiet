@@ -185,6 +185,7 @@ const mcp = {
 // ─────────────── the cloud button and its sheet (plain words, cloud-model.md › "Your data")
 function sentence() {
   const p = cloud.phase, when = (t) => t ? new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+  if (!G.wasSignedIn() && !G.isSignedIn() && cloud.lastError) return 'Not connected: ' + cloud.lastError + ' Progress is saved on this device.';
   if (!G.wasSignedIn() && !G.isSignedIn()) return 'Saved on this device only. Connect Google to keep a copy on your Drive and use Bassiet on your other devices.';
   if (p === 'sync') return 'Saving to your Drive…';
   if (p === 'tap' || (!G.isSignedIn() && G.wasSignedIn())) return 'Saved on this device. Google needs a tap to reconnect before Drive gets the latest.';
@@ -231,7 +232,7 @@ function start() {
   started = (async () => {
     await loadDevice();
     G.loadSeen(Object.keys(state.recs).length > 0);
-    try { const r = await G.takeRedirect(); if (r && !r.ok) cloud.lastError = r.message; } catch {}
+    try { const r = await G.takeRedirect(window.__bassietGoogleHash); window.__bassietGoogleHash = ''; if (r && !r.ok) cloud.lastError = r.message; if (r && r.ok) cloud.phase = 'idle'; } catch {}
     G.init(CLIENT_ID).catch(() => {});
     G.renewOnTap(() => sync());
     G.onAuthChange(() => paint());
