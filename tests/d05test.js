@@ -1,4 +1,4 @@
-const __APP=process.env.APP_DIR||require('path').resolve(__dirname,'../app');
+const __APP=process.env.APP_DIR||require('path').resolve(__dirname,'../docs');
 // D05 checks: shuffle, transmissions, depth intro, radio queue, duel fixes, restain guard, dive log, weak points, Yuzu, seal rule, ending, keyboard.
 const {chromium}=require('playwright');
 const ROOT=process.argv[2]||__APP;

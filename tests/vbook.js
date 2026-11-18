@@ -1,5 +1,5 @@
 global.window=global;global.CT={};
-const fs=require('fs');const dir=require('path').resolve(process.argv[2]||require('path').resolve(__dirname,'../app'));
+const fs=require('fs');const dir=require('path').resolve(process.argv[2]||require('path').resolve(__dirname,'../docs'));
 const order=[...fs.readFileSync(dir+'/index.html','utf8').matchAll(/<script src="([^"]+)"/g)].map(m=>m[1]);
 for(const f of order.filter(f=>/^(bank.*|book.*|depths|story|links)\.js$/.test(f)))if(fs.existsSync(dir+'/'+f))eval(fs.readFileSync(dir+'/'+f,'utf8'));
 let ok=true,ch=0,qs=0,figs=new Set(),words=0;

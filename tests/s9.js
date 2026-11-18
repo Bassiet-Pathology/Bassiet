@@ -1,4 +1,4 @@
-const __APP=process.env.APP_DIR||require('path').resolve(__dirname,'../app');
+const __APP=process.env.APP_DIR||require('path').resolve(__dirname,'../docs');
 const {chromium}=require('playwright');const O=__dirname+'/out/';
 const U='file://'+__APP+'/index.html';
 (async()=>{const b=await chromium.launch();const errs=[];

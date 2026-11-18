@@ -6,8 +6,8 @@
    - Plates (/_blob/<id>, immutable): cache first, at most 150 kept.
    - Google Fonts: cache first in their own cache, so headings keep their face offline after one online visit.
    FILES and V are regenerated from the folder by beta/work-D02/gen-sw.js; V changes whenever any file does. */
-const V='bassiet-01bb2ca916';
-const FILES=["app-core.js","app-dive.js","app-practice.js","app-today.js","bank1.js","bank2.js","bank3.js","bank4.js","bank5.js","bank6a.js","bank6b.js","bank6c.js","bank7.js","bank8.js","bank9.js","book10.js","book11.js","book12.js","book13.js","book14.js","book15.js","book16a.js","book16b.js","book1a.js","book1b.js","book2.js","book3.js","book4.js","book5a.js","book5b.js","book6.js","book7.js","book8a.js","book8b.js","book9a.js","book9b.js","bookx1.js","bookx2.js","d02-maskable-512.png","depths.js","figs.js","figs2.js","figs3.js","figs4.js","figs5.js","figs6.js","figs7.js","icon-180.png","icon-192.png","icon-512.png","links.js","manifest.json","story.js"];
+const V='bassiet-911d81ff4d';
+const FILES=["app-core.js","app-dive.js","app-practice.js","app-today.js","bank1.js","bank2.js","bank3.js","bank4.js","bank5.js","bank6a.js","bank6b.js","bank6c.js","bank7.js","bank8.js","bank9.js","book10.js","book11.js","book12.js","book13.js","book14.js","book15.js","book16a.js","book16b.js","book1a.js","book1b.js","book2.js","book3.js","book4.js","book5a.js","book5b.js","book6.js","book7.js","book8a.js","book8b.js","book9a.js","book9b.js","bookx1.js","bookx2.js","d02-maskable-512.png","depths.js","figs.js","figs2.js","figs3.js","figs4.js","figs5.js","figs6.js","figs7.js","icon-180.png","icon-192.png","icon-512.png","links.js","manifest.json","story.js","web/boot.js","web/cloudparts.js","web/devstore.js","web/google.js","web/shim.js"];
 const SHELL=['./','index.html'];
 const FONTS='bassiet-fonts',BLOBS='bassiet-blobs',KEEP=[V,FONTS,BLOBS],WAIT=3500;
 

@@ -303,7 +303,7 @@ function compareView(it){
 function imageView(it){
   var o=it.o,s=CT.ps.cur;
   var h='<div class="stage"><div class="muted">What is this?</div><p class="q" tabindex="-1">Name the finding or structure.</p>';
-  h+=o.assetId?'<img src="'+esc('/_blob/'+encodeURIComponent(o.assetId))+'" alt="Your mounted plate to identify">':'<div class="empty" style="margin-top:10px">This plate has no image file. Delete it in Plates and mount it again.</div>';
+  h+=o.assetId?'<img src="'+esc(CT.blobUrl(o.assetId))+'" alt="Your mounted plate to identify">':'<div class="empty" style="margin-top:10px">This plate has no image file. Delete it in Plates and mount it again.</div>';
   if(!s.shown)return h+'<div class="row" style="margin-top:14px"><button class="btn primary" data-act="imgShow">Show answer</button></div></div>';
   h+='<p id="p-res" tabindex="-1" style="margin:14px 0 4px"><b>'+esc(o.answer)+'</b></p>';
   if(o.notes)h+='<p>'+esc(o.notes)+'</p>';
@@ -448,7 +448,7 @@ CT.views.images=function(){
   if(!list.length)return h+'<div class="empty"><strong>No plates mounted.</strong> Bring back what you saw under the scope: a slide from the lab, a photo from a lecture. Each one joins the Plates practice mode.</div>';
   h+='<div class="gallery">'+list.map(function(x){
     var con=x.concept&&CT.concepts[x.concept];
-    return '<div class="tile">'+(x.assetId?'<img src="/_blob/'+esc(encodeURIComponent(x.assetId))+'" alt="'+esc(x.answer)+'" loading="lazy">':'<div class="empty" style="aspect-ratio:4/3;border:0;display:flex;align-items:center;justify-content:center">No image file</div>')+'<div class="tb"><b>'+esc(x.answer)+'</b><div class="row">'+(x.discipline?'<span class="chip d-'+esc(x.discipline)+'">'+esc(DN[x.discipline]||x.discipline)+'</span>':'')+(x.system?'<span class="chip">'+esc(x.system)+'</span>':'')+(x.kind?'<span class="chip">'+esc(x.kind)+'</span>':'')+'</div>'+
+    return '<div class="tile">'+(x.assetId?'<img src="'+esc(CT.blobUrl(x.assetId))+'" alt="'+esc(x.answer)+'" loading="lazy">':'<div class="empty" style="aspect-ratio:4/3;border:0;display:flex;align-items:center;justify-content:center">No image file</div>')+'<div class="tb"><b>'+esc(x.answer)+'</b><div class="row">'+(x.discipline?'<span class="chip d-'+esc(x.discipline)+'">'+esc(DN[x.discipline]||x.discipline)+'</span>':'')+(x.system?'<span class="chip">'+esc(x.system)+'</span>':'')+(x.kind?'<span class="chip">'+esc(x.kind)+'</span>':'')+'</div>'+
       (con?'<button class="linkbtn" data-act="openConcept" data-id="'+esc(x.concept)+'">'+esc(con.n)+'</button>':'')+
       (x.notes||x.ref?'<details><summary>Notes</summary><p style="margin:6px 0 0">'+esc(x.notes||'')+'</p>'+(x.ref?'<p class="muted mono" style="margin:4px 0 0;font-size:12px">'+esc(x.ref)+'</p>':'')+'</details>':'')+
       '<div>'+confirmBtn('img-'+x.id,'Delete','imgDel',x.id)+'</div></div></div>';

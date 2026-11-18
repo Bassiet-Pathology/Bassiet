@@ -1,6 +1,6 @@
 # Tests
 Needs Node 18+ and Playwright with Chromium (`npm i -g playwright && npx playwright install chromium`), run with `NODE_PATH=$(npm root -g)`.
-Each script loads `../app/index.html` (override with `APP_DIR`). Screenshots go to tests/out/.
+Each script loads `../docs/index.html` (override with `APP_DIR`). Screenshots go to tests/out/.
 
 Release gate (all must pass):
 - `node tests/validate.js` — Atlas content (ids, links, no isolated concepts)
@@ -11,3 +11,4 @@ Release gate (all must pass):
 - `node tests/figall.js` — every figure renders and every button works
 - `node tests/drivetest.js` — Drive folder resolution against a fake Drive
 Extra: s8.js (re-stain, losing duel; its duel step predates the new Depth 1 metabolism stratum), s9.js (Atlas/Practice), figshot.js <ids> (renders figures to figs.png), final.js (phone/desktop screenshots).
+- `node tests/webmode.js` and `node tests/cloud.mjs` — website mode (serve docs/ first: `python3 -m http.server 8765 --directory docs`): device storage survives reload; two devices sync through a fake Google Drive (fake-google.mjs from Sudachi)

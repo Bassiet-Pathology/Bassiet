@@ -13,6 +13,7 @@ CT.data={prog:[],notes:[],images:[],misses:[],days:[],reads:[]};
 CT.loaded={prog:false,notes:false,images:false,misses:false,days:false,reads:false};
 CT.ui={loading:true,stale:false,local:false,readonly:false,storage:'',confirm:null,draft:{},hub:{busy:false,last:0,msg:''}};
 CT.db=null;CT.assets=null;CT.mcp=null;
+CT.blobUrl=function(id){return '/_blob/'+encodeURIComponent(id)};   /* web/shim.js replaces this on the website */
 CT.pmap={};CT.nmap={};
 CT.render=function(){};
 

@@ -1,4 +1,4 @@
-const __APP=process.env.APP_DIR||require('path').resolve(__dirname,'../app');
+const __APP=process.env.APP_DIR||require('path').resolve(__dirname,'../docs');
 const {chromium}=require('playwright');const {spawn}=require('child_process');
 (async()=>{const srv=spawn('python3',['-m','http.server','8765','--bind','127.0.0.1'],{cwd:__APP,stdio:'ignore'});
 await new Promise(r=>setTimeout(r,800));

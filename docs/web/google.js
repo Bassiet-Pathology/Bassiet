@@ -1,0 +1,622 @@
+// Google for Bassiet (website mode): sign-in (Google Identity Services token client) and Drive.
+// Copied from Sudachi 1.4.0 (the family's cloud reference, claude/cloud-model.md); Calendar and the My Apps scan are left out.
+// One Cloud project / web client for all the apps (Yuzu, Mephisto, Orange, Sinus…), no backend, no secret.
+//
+// Sign-in: the first connect shows Google's consent window. Afterwards a renewal (`prompt: ''`) goes through without a
+// screen, but phones only let Google's window open inside a tap — so renewals happen on the next tap anywhere in the
+// app (see renewOnTap), never from a timer. The one-hour token lives in localStorage on this device only.
+//
+// Drive layout (HUB.md): My Apps/hub/bassiet/{state,status}.json · My Apps/hub/bassiet/backups/state-YYYY-MM-DD.json.
+// Bassiet only READS other apps' files (mandarin/shifts.json for your shifts, citrus/state.json once for the migration,
+// citrus/plan.json for Plan's blocks);
+// it never writes into another app's folder, and never touches My Apps/Rotas (Mandarin's).
+//
+// What keeps it fast and solid:
+//  - folder ids cached by path and verified once per app session (one request for the deepest folder vouches for the path)
+//  - one in-flight lookup per path (parallel steps never create twin folders); writes to one file are queued
+//  - the Drive changes feed answers "anything new?" in one request; only what changed is read again
+//  - every file Bassiet writes carries a content fingerprint (appProperties.h): identical content is never re-uploaded,
+//    and other devices can tell what changed from the changes feed without downloading
+//  - state.json is written only after checking nobody else wrote it since we read it (else: pull, merge, write)
+//  - duplicates (a create whose answer was lost) are healed: newest wins, the rest go to the trash
+//  - retries with jittered backoff for dropped connections (~25 s), rate limits and 5xx; offline fails fast
+
+import { split, isPart } from './cloudparts.js';
+
+const SCOPES = 'https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/userinfo.email';
+const TOKEN_KEY = 'bassiet.google';     // {access_token, exp, email}
+const IDS_KEY = 'bassiet.drive.ids';    // path → folder id, file ids by "path/name"
+export const DRIVE = 'https://www.googleapis.com/drive/v3';
+export const UPLOAD = 'https://www.googleapis.com/upload/drive/v3';
+const FOLDER = 'application/vnd.google-apps.folder';
+
+export class GoogleError extends Error {
+  constructor(message, { status = 0, auth = false, retryable = false, network = false } = {}) { super(message); this.status = status; this.auth = auth; this.retryable = retryable; this.network = network; }
+}
+export const stats = { requests: 0, retries: 0, errors: 0, timeouts: 0, lastError: '', lastErrorAt: 0, skippedWrites: 0, bytesUp: 0, bytesDown: 0, healed: 0 };
+export const auth = { needsSignIn: false, lastError: '', lastEvent: '' };
+
+// ════════════════════════════════════════ token & sign-in
+let token = loadToken();
+let clientId = '';
+let tokenClient = null;
+let pending = null;            // {resolve, reject} of the request in flight
+let closeGrace = null;         // after a "window closed", how long a late token is still awaited
+const lateListeners = new Set();   // told when a token arrives with nothing waiting for it
+export function onLateToken(fn) { lateListeners.add(fn); return () => lateListeners.delete(fn); }
+const authListeners = new Set();
+
+function loadToken() { try { return JSON.parse(localStorage.getItem(TOKEN_KEY) || 'null'); } catch { return null; } }
+function saveToken(t) {
+  token = t ? { ...(token || {}), ...t } : null;
+  try { token ? localStorage.setItem(TOKEN_KEY, JSON.stringify(token)) : localStorage.removeItem(TOKEN_KEY); } catch {}
+  for (const fn of authListeners) fn(isSignedIn());
+}
+function expireToken() { if (token) { auth.needsSignIn = true; saveToken({ access_token: '', exp: 0 }); } }
+export function onAuthChange(fn) { authListeners.add(fn); return () => authListeners.delete(fn); }
+export function isSignedIn() { return !!(token?.access_token && token.exp - Date.now() > 60000); }
+export function wasSignedIn() { return !!(token?.email); }
+export function accountEmail() { return token?.email || ''; }
+export function tokenMinutesLeft() { return token?.exp ? Math.max(0, Math.round((token.exp - Date.now()) / 60000)) : 0; }
+
+let gisLoading = null;
+function loadGis() {
+  if (window.google?.accounts?.oauth2) return Promise.resolve();
+  if (gisLoading) return gisLoading;
+  gisLoading = new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = 'https://accounts.google.com/gsi/client'; s.async = true;
+    s.onload = () => res(); s.onerror = () => { gisLoading = null; rej(new GoogleError('Google sign-in did not load. Are you online?', { retryable: true, network: true })); };
+    document.head.append(s);
+  });
+  return gisLoading;
+}
+
+/** Prepare sign-in: load Google's script and the token client now, so a later tap can open the window at once. */
+export async function init(id) {
+  clientId = id; if (!clientId) return false;
+  if (redirectMode()) { loadGis().then(() => setupClient()).catch(() => {}); return true; }   // the popup isn't used here
+  await loadGis();
+  setupClient();
+  return true;
+}
+function setupClient() {
+  tokenClient = window.google.accounts.oauth2.initTokenClient({
+    client_id: clientId, scope: SCOPES, include_granted_scopes: true,
+    callback: async (r) => {
+      // a token is kept even when Google reported the window "closed" first (it can, on phones and installed apps: the
+      // window's closing is seen before its answer arrives). Dropping it here was the sign-in loop of 18/11/2026.
+      const p = pending; pending = null; clearTimeout(closeGrace);
+      auth.lastEvent = r.error ? `error: ${r.error}` : 'token';
+      if (r.access_token) {
+        const drive = window.google?.accounts?.oauth2?.hasGrantedAllScopes ? window.google.accounts.oauth2.hasGrantedAllScopes(r, 'https://www.googleapis.com/auth/drive') : true;
+        if (!drive) { auth.lastError = 'Drive was not allowed'; const e = new GoogleError('Google signed you in but did not allow Drive. Sign in again and tick the box for Google Drive.', { auth: true }); return p ? p.reject(e) : (auth.needsSignIn = true, authListeners.forEach(fn => fn(false))); }
+      }
+      if (!p && !r.access_token) return;
+      if (r.error) { auth.lastError = r.error_description || r.error; return p.reject(new GoogleError(/interaction|login_required|consent/.test(r.error) ? 'Google needs you to sign in again.' : `Google sign-in: ${auth.lastError}`, { status: 401, auth: true })); }
+      saveToken({ access_token: r.access_token, exp: Date.now() + (Number(r.expires_in) || 3600) * 1000 });
+      auth.needsSignIn = false; auth.lastError = '';
+      if (!token.email) { try { const u = await userInfo(); saveToken({ email: u.email || '' }); } catch {} }
+      if (p) p.resolve(token); else for (const fn of lateListeners) try { fn(token); } catch {}
+    },
+    error_callback: (e) => {
+      auth.lastEvent = `window: ${e?.type || 'error'}`;
+      if (!pending) return;
+      // "closed" can come before the answer: wait a little for the token before giving up (no second window is opened)
+      if (e?.type === 'popup_closed') { const p = pending; clearTimeout(closeGrace); closeGrace = setTimeout(() => { if (pending === p) { pending = null; preferRedirect(); p.reject(new GoogleError('Google\'s window lost its answer. Tap Sign in once more: this time Google opens in the same window and comes back here.', { auth: true })); } }, 8000); return; }
+      const p = pending; pending = null;
+      p.reject(new GoogleError(e?.type === 'popup_closed' ? 'Sign-in window closed.' : e?.type === 'popup_failed_to_open' ? 'The browser blocked Google\'s window — tap again.' : `Google sign-in: ${e?.message || e?.type || 'failed'}`, { auth: true }));
+    },
+  });
+  return true;
+}
+
+// ──────────── sign-in by going to Google and back (no popup)
+// An app installed on the home screen (Android especially) often never receives the popup's answer: the window closes,
+// the token is lost, and the owner signs in again and again (18/11/2026, twice). So installed apps — and any device
+// where the popup failed once — send the whole page to Google and read the token from the address Google sends back to.
+// The return address (this page, e.g. https://bassiet-library.github.io/Bassiet/) must be listed under "Authorized
+// redirect URIs" of the shared OAuth client.
+const MODE_KEY = 'bassiet.google.mode';      // 'redirect' after a popup failed on this device
+const BACK_KEY = 'bassiet.google.back';      // {state, hash, at} while away at Google
+export const returnAddress = () => location.origin + location.pathname.replace(/index\.html$/, '');
+const installed = () => { try { return matchMedia('(display-mode: standalone)').matches || matchMedia('(display-mode: minimal-ui)').matches || navigator.standalone === true; } catch { return false; } };
+export function redirectMode() { try { if (localStorage.getItem(MODE_KEY) === 'redirect') return true; } catch {} return installed(); }
+function preferRedirect() { try { localStorage.setItem(MODE_KEY, 'redirect'); } catch {} }
+
+/** Leave for Google's sign-in page; the app opens again with the token in the address. */
+export function signInRedirect({ renew = false } = {}) {
+  if (!clientId) throw new GoogleError('Add the Google client ID in Settings first.', { auth: true });
+  const state = Array.from(crypto.getRandomValues(new Uint8Array(12)), b => b.toString(16).padStart(2, '0')).join('');
+  try { localStorage.setItem(BACK_KEY, JSON.stringify({ state, hash: location.hash, at: Date.now() })); } catch {}
+  const q = new URLSearchParams({ client_id: clientId, redirect_uri: returnAddress(), response_type: 'token', scope: SCOPES, include_granted_scopes: 'true', state });
+  if (!renew) q.set('prompt', 'consent');
+  if (token?.email) q.set('login_hint', token.email);
+  auth.lastEvent = 'redirect: away';
+  location.assign('https://accounts.google.com/o/oauth2/v2/auth?' + q);
+  return new Promise(() => {});   // the page is leaving
+}
+
+/** On start-up: if Google just sent us back, keep the token and tidy the address. → null | {ok:true} | {ok:false, message} */
+export async function takeRedirect() {
+  const h = location.hash || '';
+  if (!/[#&](access_token|error)=/.test(h)) return null;
+  const r = Object.fromEntries(new URLSearchParams(h.slice(1)));
+  let back = null; try { back = JSON.parse(localStorage.getItem(BACK_KEY) || 'null'); localStorage.removeItem(BACK_KEY); } catch {}
+  history.replaceState(null, '', location.pathname + location.search + (back?.hash && !/access_token|error=/.test(back.hash) ? back.hash : '#more'));
+  if (!back || back.state !== r.state) { auth.lastEvent = 'redirect: state mismatch'; return { ok: false, message: 'That Google answer was not for this sign-in. Tap Sign in again.' }; }
+  if (r.error) { auth.lastEvent = `redirect: ${r.error}`; auth.lastError = r.error; return { ok: false, message: r.error === 'access_denied' ? 'Google sign-in was cancelled.' : `Google sign-in: ${r.error}` }; }
+  if (!String(r.scope || '').split(/\s+/).includes('https://www.googleapis.com/auth/drive')) { auth.lastEvent = 'redirect: no drive'; auth.lastError = 'Drive was not allowed'; return { ok: false, message: 'Google signed you in but did not allow Drive. Sign in again and tick the box for Google Drive.' }; }
+  saveToken({ access_token: r.access_token, exp: Date.now() + (Number(r.expires_in) || 3600) * 1000 });
+  auth.needsSignIn = false; auth.lastError = ''; auth.lastEvent = 'redirect: token';
+  if (!token.email) { try { const u = await userInfo(); saveToken({ email: u.email || '' }); } catch {} }
+  return { ok: true };
+}
+
+/** The token client is ready (Google's script loaded at start-up): a tap can open the window at once, inside the tap. */
+export const ready = () => !!tokenClient || (redirectMode() && !!clientId);
+/** Get a token. Must run inside a tap on phones. `renew`: the account already agreed, so no consent screen. */
+export function signIn({ renew = false } = {}) {
+  if (redirectMode() && clientId) return signInRedirect({ renew });
+  if (pending) return pending.promise;
+  if (!tokenClient) return Promise.reject(new GoogleError(clientId ? 'Google sign-in is still loading — tap again.' : 'Add the Google client ID in Settings first.', { auth: true }));
+  let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; });
+  pending = { resolve, reject, promise };
+  const timer = setTimeout(() => { if (pending?.promise === promise) { pending = null; reject(new GoogleError('Sign-in took too long — tap again.', { auth: true })); } }, renew ? 20000 : 180000);
+  promise.finally(() => clearTimeout(timer)).catch(() => {});
+  tokenClient.requestAccessToken({ prompt: renew ? '' : 'consent', ...(token?.email ? { hint: token.email } : {}) });   // synchronous: keeps the tap's permission to open a window
+  return promise;
+}
+
+/** The token expires after an hour. The next tap anywhere renews it (no screen), so syncs keep working on phones. */
+let tapHooked = false;
+export function renewOnTap(onRenewed) {
+  if (tapHooked) return; tapHooked = true;
+  document.addEventListener('pointerdown', () => {
+    if (isSignedIn() || !wasSignedIn() || !tokenClient || pending || navigator.onLine === false) return;
+    if (redirectMode()) { auth.needsSignIn = true; for (const fn of authListeners) fn(false); return; }   // leaving the page needs a deliberate tap on Reconnect
+    signIn({ renew: true }).then(() => onRenewed?.()).catch(() => { auth.needsSignIn = true; for (const fn of authListeners) fn(false); });
+  }, { capture: true });
+}
+
+export function signOut() {
+  if (token?.access_token && window.google?.accounts?.oauth2) try { window.google.accounts.oauth2.revoke(token.access_token, () => {}); } catch {}
+  saveToken(null); auth.needsSignIn = false; ids = {}; persistIds(); verified.clear();
+}
+
+// ════════════════════════════════════════ requests
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const backoff = (attempt, retryAfter) => sleep(retryAfter ? Math.min(30000, retryAfter * 1000) : Math.min(16000, 800 * 2 ** attempt) * (0.75 + Math.random() * 0.5));
+const SAFE = /^(GET|HEAD|PATCH|PUT|DELETE)$/i;
+
+/** Authenticated fetch: retries what can be retried, plain-word errors, a 401 asks for a tap. `raw` returns bytes. */
+async function gfetch(url, opts = {}) {
+  if (!isSignedIn()) { if (wasSignedIn()) auth.needsSignIn = true; throw new GoogleError(wasSignedIn() ? 'Google needs a tap to reconnect.' : 'Not signed in to Google.', { status: 401, auth: true }); }
+  if (navigator.onLine === false) throw new GoogleError('You\'re offline — nothing is lost; Bassiet syncs when you\'re back.', { network: true, retryable: true });
+  const method = opts.method || 'GET';
+  let res, msg = '';
+  for (let attempt = 0; ; attempt++) {
+    stats.requests++;
+    // every request has a deadline: a hung connection ("lie-fi") must never freeze syncing until the app is reopened
+    const ctl = typeof AbortController !== 'undefined' ? new AbortController() : null, limit = opts.timeout || (opts.body && String(opts.body).length > 200000 ? 120000 : 30000);
+    const timer = ctl ? setTimeout(() => ctl.abort(), limit) : null;
+    try { res = await fetch(url, { ...opts, timeout: undefined, signal: ctl?.signal, cache: 'no-store', headers: { ...(opts.headers || {}), Authorization: `Bearer ${token.access_token}` } }); }
+    catch (e) {
+      clearTimeout(timer); if (e?.name === 'AbortError') stats.timeouts = (stats.timeouts || 0) + 1;
+      // a dropped connection: repeat requests that are safe to send twice, for ~25 s
+      if ((SAFE.test(method) || opts.retrySafe) && attempt < 5) { stats.retries++; await backoff(attempt); continue; }
+      fail(e?.name === 'AbortError' ? 'Timed out' : 'Network error'); throw new GoogleError(e?.name === 'AbortError' ? 'Google took too long to answer — Bassiet tries again shortly.' : 'Google couldn\'t be reached — the connection dropped.', { network: true, retryable: true });
+    }
+    clearTimeout(timer);
+    msg = '';
+    if (res.status === 403 || res.status === 429) { try { const j = await res.clone().json(); msg = `${j?.error?.message || ''} ${(j?.error?.errors || []).map(x => x.reason).join(' ')}`; } catch {} }
+    const slowDown = res.status === 429 || (res.status === 403 && /rate ?limit|quota|userRateLimitExceeded|rateLimitExceeded/i.test(msg));
+    if ((slowDown || res.status >= 500) && attempt < 6) { stats.retries++; await backoff(attempt + 1, +res.headers.get('retry-after') || 0); continue; }
+    break;
+  }
+  if (res.ok) {
+    if (res.status === 204) return null;
+    if (opts.raw) { const b = await res.arrayBuffer(); stats.bytesDown += b.byteLength; return b; }
+    const ct = res.headers.get('content-type') || '';
+    return ct.includes('json') ? res.json() : res.arrayBuffer();
+  }
+  if (!msg) { try { msg = (await res.clone().json())?.error?.message || ''; } catch {} }
+  if (res.status === 401 || (res.status === 403 && /insufficient|scope/i.test(msg))) { expireToken(); fail('Sign-in expired'); throw new GoogleError('Google needs a tap to reconnect.', { status: res.status, auth: true }); }
+  fail(`${res.status} ${msg.trim() || res.statusText}`);
+  throw new GoogleError(res.status === 404 ? 'Not found on Drive.' : res.status >= 500 || res.status === 429 ? `Google is busy (${res.status}) — Bassiet tries again later.` : `Google ${res.status}: ${msg.trim() || res.statusText}`, { status: res.status, retryable: res.status >= 500 || res.status === 429 });
+}
+function fail(m) { stats.errors++; stats.lastError = m; stats.lastErrorAt = Date.now(); }
+
+export async function userInfo() { return gfetch('https://www.googleapis.com/oauth2/v3/userinfo'); }
+
+// ════════════════════════════════════════ Drive basics
+const q = (s) => String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+let ids = {};
+try { ids = JSON.parse(localStorage.getItem(IDS_KEY) || '{}') || {}; } catch {}
+function persistIds() { try { localStorage.setItem(IDS_KEY, JSON.stringify(ids)); } catch {} }
+const verified = new Set();       // ids confirmed to exist this session
+export function knownFolderIds() { return { ...ids }; }
+/** Check every cached folder id again on next use (a full sync does this). */
+export function reverify() { verified.clear(); }
+/** Forget every cached id (a watched folder was deleted or moved): paths are looked up again, created if missing. */
+export function forgetFolders() { ids = {}; persistIds(); verified.clear(); seenState = null; for (const k of Object.keys(tagCache)) delete tagCache[k]; }
+
+const FIELDS = 'id,name,mimeType,createdTime,modifiedTime,size,md5Checksum,appProperties,parents,trashed';
+async function list(parentId, { name, folders, extra, all } = {}) {
+  const parts = ['trashed = false', `'${q(parentId)}' in parents`];
+  if (name) parts.push(`name = '${q(name)}'`);
+  if (folders) parts.push(`mimeType = '${FOLDER}'`);
+  if (extra) parts.push(extra);
+  const out = []; let page = '';
+  do {
+    const p = new URLSearchParams({ q: parts.join(' and '), fields: `nextPageToken,files(${FIELDS})`, pageSize: all ? '1000' : '100', orderBy: 'modifiedTime desc', spaces: 'drive', ...(page ? { pageToken: page } : {}) });
+    const j = await gfetch(`${DRIVE}/files?${p}`);
+    out.push(...(j.files || []));
+    page = all ? j.nextPageToken || '' : '';
+  } while (page);
+  return out;
+}
+export async function fileMeta(id, fields = FIELDS) { return gfetch(`${DRIVE}/files/${encodeURIComponent(id)}?fields=${encodeURIComponent(fields)}`); }
+async function mkdir(name, parentId, description = '') {
+  const j = await gfetch(`${DRIVE}/files?fields=id`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, mimeType: FOLDER, parents: [parentId], ...(description ? { description } : {}) }) });
+  return j.id;
+}
+async function trash(id) { await gfetch(`${DRIVE}/files/${encodeURIComponent(id)}?fields=id`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ trashed: true }) }); }
+
+async function exists(id) {
+  if (verified.has(id)) return true;
+  try { const f = await fileMeta(id, 'id,trashed'); if (f && !f.trashed) { verified.add(id); return true; } } catch (e) { if (e.status !== 404) throw e; }
+  return false;
+}
+// Folder id for a path like ['My Apps','hub','bassiet'], created where missing. Each level is resolved once at a time.
+const pathInflight = new Map();
+export async function ensurePath(parts, { create = true } = {}) {
+  const key = parts.join('/');
+  // fast path: the cached deepest id, checked once per session, vouches for the whole path
+  if (ids[key] && await exists(ids[key])) return ids[key];
+  if (ids[key]) { for (const k of Object.keys(ids)) if (k === key || k.startsWith(key + '/')) delete ids[k]; persistIds(); }
+  return resolve(parts, create);
+}
+function resolve(parts, create) {
+  if (!parts.length) return Promise.resolve('root');
+  const key = parts.join('/');
+  if (ids[key] && verified.has(ids[key])) return Promise.resolve(ids[key]);
+  if (pathInflight.has(key)) return pathInflight.get(key);
+  if (!create && pathInflight.has(key + '?')) return pathInflight.get(key + '?');
+  const flight = key + (create ? '' : '?');
+  const p = (async () => {
+    const parent = await resolve(parts.slice(0, -1), create);
+    if (!parent) return null;
+    if (ids[key] && await exists(ids[key])) return ids[key];
+    const name = parts[parts.length - 1];
+    const found = await list(parent, { name, folders: true });
+    // twins (an earlier race): the oldest is the real one; Repair Drive merges the others into it
+    const pick = found.sort((a, b) => (a.createdTime || a.modifiedTime || '').localeCompare(b.createdTime || b.modifiedTime || ''))[0];
+    const id = pick ? pick.id : create ? await mkdir(name, parent) : null;
+    if (id) { ids[key] = id; verified.add(id); persistIds(); }
+    return id;
+  })().finally(() => pathInflight.delete(flight));
+  pathInflight.set(flight, p);
+  return p;
+}
+
+/** The newest file called `name` in a folder; older twins are returned so the caller can heal them. */
+async function findFile(folderId, name) {
+  const files = await list(folderId, { name });
+  files.sort((a, b) => (b.modifiedTime || '').localeCompare(a.modifiedTime || ''));
+  return { file: files[0] || null, twins: files.slice(1) };
+}
+export async function downloadFile(fileId) { return gfetch(`${DRIVE}/files/${encodeURIComponent(fileId)}?alt=media`, { raw: true }); }
+const decode = (buf) => new TextDecoder().decode(buf);
+
+// Fingerprint of a JSON payload (FNV-1a over canonical JSON: keys sorted, so key order never matters), stored as appProperties.h
+export function fingerprint(obj, omit = ['updatedAt']) {
+  const s = JSON.stringify(obj, (k, v) => (omit.includes(k) ? undefined : v && typeof v === 'object' && !Array.isArray(v) ? Object.fromEntries(Object.keys(v).sort().map(x => [x, v[x]])) : v));
+  let h = 2166136261; for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619);
+  return (h >>> 0).toString(16) + ':' + s.length;
+}
+
+// One write at a time per file; the same content is never uploaded twice.
+const writeQueue = new Map();
+const lastWritten = new Map();   // "folder/name" → fingerprint we last uploaded
+function putJson(folderId, name, obj, { props = {}, fileId = null, healTwins = false, omit, always = false } = {}) {
+  const key = `${folderId}/${name}`;
+  const prev = writeQueue.get(key) || Promise.resolve();
+  const next = prev.catch(() => {}).then(() => putJsonOnce(folderId, name, obj, props, fileId, healTwins, key, omit, always));
+  writeQueue.set(key, next);
+  next.finally(() => { if (writeQueue.get(key) === next) writeQueue.delete(key); }).catch(() => {});
+  return next;
+}
+async function putJsonOnce(folderId, name, obj, props, fileId, healTwins, key, omit, always) {
+  const h = fingerprint(obj, omit);
+  const idKey = `file:${key}`;
+  let id = fileId || ids[idKey] || null;
+  let twins = [];
+  if (!id) { const r = await findFile(folderId, name); id = r.file?.id || null; twins = r.twins; if (!always && r.file?.appProperties?.h === h) { ids[idKey] = id; persistIds(); lastWritten.set(key, h); stats.skippedWrites++; return { id, modifiedTime: r.file.modifiedTime, skipped: true }; } }
+  else if (!always && lastWritten.get(key) === h) { stats.skippedWrites++; return { id, skipped: true }; }
+  const body = JSON.stringify(obj);
+  const boundary = 'bassiet' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const meta = id ? { appProperties: { ...props, h } } : { name, parents: [folderId], mimeType: 'application/json', appProperties: { ...props, h } };
+  const payload = `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(meta)}\r\n--${boundary}\r\nContent-Type: application/json\r\n\r\n${body}\r\n--${boundary}--`;
+  let r;
+  try { r = await gfetch(`${UPLOAD}/files${id ? '/' + encodeURIComponent(id) : ''}?uploadType=multipart&fields=id,modifiedTime`, { method: id ? 'PATCH' : 'POST', headers: { 'Content-Type': `multipart/related; boundary=${boundary}` }, body: payload }); }
+  catch (e) {
+    if (e.status === 404 && id) { delete ids[idKey]; persistIds(); return putJsonOnce(folderId, name, obj, props, null, healTwins, key, omit, always); }   // deleted on Drive: create again
+    if (e.network && !id) {   // a create whose answer was lost may have happened: look before trying again
+      const again = await findFile(folderId, name).catch(() => null);
+      if (again?.file?.appProperties?.h === h) { ids[idKey] = again.file.id; persistIds(); lastWritten.set(key, h); return { id: again.file.id, modifiedTime: again.file.modifiedTime }; }
+    }
+    throw e;
+  }
+  stats.bytesUp += body.length;
+  ids[idKey] = r.id; persistIds(); lastWritten.set(key, h);
+  if (healTwins && twins.length) for (const t of twins) trash(t.id).catch(() => {});
+  return r;
+}
+async function readJsonFile(file) {
+  const buf = await downloadFile(file.id);
+  try { return JSON.parse(decode(buf)); } catch { return null; }
+}
+
+// ════════════════════════════════════════ changes feed
+/** A token marking "now" in the Drive changes feed. */
+export async function startToken() { return (await gfetch(`${DRIVE}/changes/startPageToken`))?.startPageToken || ''; }
+/** Everything that changed in My Drive since `token` (one request when nothing did). null when the token expired (start over). */
+export async function changesSince(tokenStr, maxPages = 20) {
+  const out = []; let t = tokenStr; let next = tokenStr;
+  for (let i = 0; i < maxPages && t; i++) {
+    let page;
+    try { page = await gfetch(`${DRIVE}/changes?pageToken=${encodeURIComponent(t)}&fields=${encodeURIComponent('nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,mimeType,parents,trashed,modifiedTime,appProperties))')}&pageSize=1000&spaces=drive&includeRemoved=true`); }
+    catch (e) { if (e.status === 404 || e.status === 410 || e.status === 400) return null; throw e; }
+    for (const c of page.changes || []) { const f = c.file || {}; out.push({ id: f.id || c.fileId, removed: !!c.removed, name: f.name, mimeType: f.mimeType, parents: f.parents || [], trashed: !!f.trashed, modifiedTime: f.modifiedTime, props: f.appProperties || {} }); }
+    if (page.newStartPageToken) { next = page.newStartPageToken; t = ''; } else { t = page.nextPageToken || ''; next = t || next; }
+  }
+  return { changes: out, token: next, more: !!t };
+}
+
+// ════════════════════════════════════════ the hub
+export const APP = 'bassiet';
+// Folders are found by their tag, never by path (claude/drive-layout.md, 17/11/2026): every app folder carries
+// appProperties.citrusApp = "<id>", so Citrus can move and rename it under Citrus/… and Bassiet still finds it. Only when nothing
+// is tagged yet does Bassiet fall back to the old path (My Apps/hub/<id>); its own folder is then created there if missing and
+// tagged at once. Bassiet never renames or moves a folder, and never creates one by path once a tagged one exists anywhere.
+const P = (root) => ({ hub: [root, 'hub'], other: (app) => [root, 'hub', app] });
+export const TAG = 'citrusApp';
+const tagCache = {};   // app → folder id (or null), checked once per app session
+const tagInflight = new Map();
+/** The folder tagged citrusApp=<app> (the oldest when there are several), or null. */
+export function findTagged(app) {
+  if (app in tagCache) return Promise.resolve(tagCache[app]);
+  if (tagInflight.has(app)) return tagInflight.get(app);
+  const p = (async () => {
+    const cached = ids[`tag:${app}`];
+    if (cached && await exists(cached)) { const f = await fileMeta(cached, 'id,appProperties,trashed').catch(() => null); if (f && !f.trashed && f.appProperties?.[TAG] === app) return (tagCache[app] = cached); }
+    const qs = new URLSearchParams({ q: `mimeType = '${FOLDER}' and trashed = false and appProperties has { key='${TAG}' and value='${q(app)}' }`, fields: 'files(id,name,parents,createdTime)', spaces: 'drive', pageSize: '20' });
+    const j = await gfetch(`${DRIVE}/files?${qs}`);
+    const pick = (j.files || []).sort((a, b) => (a.createdTime || '').localeCompare(b.createdTime || ''))[0];
+    if (pick) { ids[`tag:${app}`] = pick.id; verified.add(pick.id); } else delete ids[`tag:${app}`];
+    persistIds();
+    return (tagCache[app] = pick ? pick.id : null);
+  })().finally(() => tagInflight.delete(app));
+  tagInflight.set(app, p); return p;
+}
+async function tagFolder(id, app) { await gfetch(`${DRIVE}/files/${encodeURIComponent(id)}?fields=id`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ appProperties: { [TAG]: app } }) }); ids[`tag:${app}`] = id; persistIds(); tagCache[app] = id; }
+/** A folder by tag; else the old path. own: create it there if missing and tag it. */
+export async function folderOf(root, app, { own = false } = {}) {
+  const t = await findTagged(app); if (t) return t;
+  const id = await ensurePath(P(root).other(app), { create: own });
+  if (id && own) await tagFolder(id, app).catch(e => console.warn('tag', e.message));
+  return id || null;
+}
+const meDir = (root) => folderOf(root, APP, { own: true });
+/** A sub-folder (backups) inside a folder found by id, created when asked. */
+async function childFolder(parentId, name, create = true) {
+  const key = `child:${parentId}/${name}`;
+  if (ids[key] && await exists(ids[key])) return ids[key];
+  const found = (await list(parentId, { name, folders: true })).sort((a, b) => (a.createdTime || '').localeCompare(b.createdTime || ''))[0];
+  const id = found ? found.id : create ? await mkdir(name, parentId) : null;
+  if (id) { ids[key] = id; verified.add(id); persistIds(); }
+  return id;
+}
+const backupsDir = async (root, create = true) => { const me = await meDir(root); return childFolder(me, 'backups', create); };
+/** Whether Bassiet found its own folder by tag this session (for status.json › drive). */
+export const ownTagged = () => !!tagCache[APP];
+
+/** Folder ids Bassiet watches in the changes feed: its own folder, and the folders of the apps it reads (Mandarin, Citrus). */
+export async function watchedFolders(root) {
+  const [me, mandarin, citrus] = await Promise.all([meDir(root), folderOf(root, 'mandarin'), folderOf(root, 'citrus')]);
+  const hub = await ensurePath(P(root).hub, { create: false }).catch(() => null);
+  return { hub: hub || '', me, mandarin: mandarin || '', citrus: citrus || '' };
+}
+
+/** Bassiet's small public file in its own folder: status.json (what Citrus shows). */
+export async function writeOwnFile(root, name, obj, { omit = ['updatedAt'] } = {}) { const dir = await meDir(root); return putJson(dir, name, obj, { omit, healTwins: true }); }
+
+/** Another app's JSON file, read only, from its tagged folder (or hub/<app>). null when it is not there. Twins are left alone (not ours to tidy). */
+export async function readOtherFile(root, app, name) {
+  const dir = await folderOf(root, app); if (!dir) return null;
+  const { file } = await findFile(dir, name); if (!file) return null;
+  const data = await readJsonFile(file);
+  return data && typeof data === 'object' ? { data, modifiedTime: file.modifiedTime, id: file.id } : null;
+}
+
+// ── Bassiet's own state on Drive: a small core (state.json) + 16 part files (media-NN.json, cloudparts.js). Each file carries its
+// revision in appProperties.rev; one folder listing tells which files another device wrote since we last read or wrote them.
+// Only those are downloaded, and only the files whose content changed are uploaded (fingerprint in appProperties.h).
+let seenState = null;        // {id, rev, modifiedTime} of state.json as last read or written (kept for the changes feed)
+let seen = {};               // file name → rev we last read or wrote (kept across sessions while this device's copy holds them)
+const SEEN_KEY = 'bassiet.drive.seen';
+/** Remember which revisions this device already holds, so a new session downloads only what changed. `holds`: this device
+ *  still has its library (false after an erase or a recovery: then everything is read again). */
+export function loadSeen(holds) { try { const j = JSON.parse(localStorage.getItem(SEEN_KEY) || 'null'); seen = holds && j && typeof j === 'object' ? j : {}; } catch { seen = {}; } }
+function saveSeen() { try { localStorage.setItem(SEEN_KEY, JSON.stringify(seen)); } catch {} }
+const fileIds = {};          // file name → Drive id (this session)
+const mine = (f) => f.name === 'state.json' || isPart(f.name);
+/** Our files in our folder, the newest of each name; older twins (an earlier race) go to the trash. */
+async function listMine(dir) {
+  const files = (await list(dir, { all: true })).filter(mine), by = {};
+  for (const f of files.sort((x, y) => (y.modifiedTime || '').localeCompare(x.modifiedTime || ''))) { if (by[f.name]) { trash(f.id).catch(() => {}); stats.healed++; } else by[f.name] = f; }
+  for (const [n, f] of Object.entries(by)) { fileIds[n] = f.id; if (f.appProperties?.h) lastWritten.set(`${dir}/${n}`, f.appProperties.h); }   // what Drive holds: an unchanged part is never uploaded again
+  return by;
+}
+/** A file we could not read: renamed aside (never overwritten), so whatever is in it can still be recovered by hand. */
+async function setAside(dir, f) {
+  await gfetch(`${DRIVE}/files/${encodeURIComponent(f.id)}?fields=id`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: f.name.replace(/\.json$/, `.damaged-${new Date().toISOString().replace(/[:.]/g, '-')}.json`) }) }).catch(() => {});
+  delete fileIds[f.name]; delete seen[f.name]; delete ids[`file:${dir}/${f.name}`]; persistIds(); lastWritten.delete(`${dir}/${f.name}`); stats.healed++;   // the next save creates a fresh file of that name
+}
+/** Read what moved on Drive since we last looked. all: read every file (a fresh device, a full pass, a recovery).
+ *  → null when Bassiet has nothing on Drive yet, else { core (or null), parts {name: data}, changed: [names], salvaged } */
+export async function loadRemoteState(root, { all = false } = {}) {
+  const dir = await meDir(root);
+  const by = await listMine(dir);
+  if (!Object.keys(by).length) { seenState = null; seen = {}; return null; }
+  const want = Object.values(by).filter(f => all || !f.appProperties?.rev || f.appProperties.rev !== seen[f.name]);
+  const out = { core: null, parts: {}, changed: [], salvaged: false };
+  await pool(want, 4, async (f) => {
+    let data = await readJsonFile(f);
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      let text = ''; try { text = decode(await downloadFile(f.id)); } catch {}
+      data = salvageJSON(text); await setAside(dir, f); out.salvaged = true;
+      if (!data) return;
+    } else {
+      seen[f.name] = f.appProperties?.rev || '';
+      if (f.appProperties?.h) lastWritten.set(`${dir}/${f.name}`, f.appProperties.h); else lastWritten.delete(`${dir}/${f.name}`);
+      if (f.name === 'state.json') seenState = { id: f.id, rev: seen[f.name], modifiedTime: f.modifiedTime };
+    }
+    if (f.name === 'state.json') out.core = data; else out.parts[f.name] = data;
+    out.changed.push(f.name);
+  });
+  saveSeen();
+  return out;
+}
+/** Has another device written any of our files since we last read them? (one listing) → names that moved */
+export async function remoteMoved(root) {
+  const dir = await meDir(root), by = await listMine(dir);
+  return Object.values(by).filter(f => (f.appProperties?.rev || '') !== seen[f.name]).map(f => f.name);   // never read (undefined) counts as moved
+}
+/** Write the state as core + parts: only files whose content changed are uploaded. Refused (conflict) when another device wrote
+ *  one of our files since we read it, unless force (the caller has just merged it). → { written, skipped } */
+export async function saveRemoteState(root, state, { force = false } = {}) {
+  const dir = await meDir(root);
+  if (!force) { const moved = await remoteMoved(root); if (moved.length) { const e = new GoogleError('Another device saved first.', { status: 409 }); e.conflict = true; e.moved = moved; throw e; } }
+  const { core, parts } = split(state), files = [['state.json', core], ...Object.entries(parts)];
+  let written = 0, skipped = 0;
+  await pool(files, 4, async ([name, obj]) => {
+    const rev = `${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 7)}`;
+    const r = await putJson(dir, name, obj, { props: { rev }, fileId: fileIds[name] || null, always: false });
+    if (r.skipped) { skipped++; return; }
+    written++; seen[name] = rev; fileIds[name] = r.id;
+    if (name === 'state.json') seenState = { id: r.id, rev, modifiedTime: r.modifiedTime };
+  });
+  saveSeen();
+  return { written, skipped };
+}
+/** A small worker pool: at most n at once, and the first real failure stops the rest (no half-hearted Promise.all). */
+async function pool(items, n, fn) {
+  let i = 0, err = null;
+  const run = async () => { while (!err && i < items.length) { const it = items[i++]; try { await fn(it); } catch (e) { err = e; } } };
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, run));
+  if (err) throw err;
+}
+export function seenStateRev() { return seen['state.json'] || ''; }
+export const seenRev = (name) => seen[name] || '';
+/** Forget what was read (after a restore or a recovery, so the next pull reads every file). */
+export function forgetSeen() { seen = {}; seenState = null; saveSeen(); }
+
+// ── daily backups of state.json: hub/bassiet/backups/state-YYYY-MM-DD.json, the newest 14 kept
+export async function backupDaily(root, state, dayKey) {
+  const dir = await backupsDir(root);
+  const name = `state-${dayKey}.json`, size = JSON.stringify(state).length;
+  // today's copy is taken again when the data has grown a lot since (the first sync of day one was an empty 717 B: beta T5-07)
+  const had = +ids[`backup:${name}`] || 0;
+  if (had && (had === 1 || size < had * 1.5 + 4000)) return false;
+  const existing = await list(dir, { extra: "name contains 'state-'" });
+  const same = existing.find(f => f.name === name);
+  if (same && !had) { ids[`backup:${name}`] = String(+same.size || 1); persistIds(); return backupDaily(root, state, dayKey); }
+  if (same) await trash(same.id).catch(() => {});
+  await putJson(dir, name, state);
+  ids[`backup:${name}`] = String(size); persistIds();
+  const old = existing.filter(f => f.name !== name).sort((a, b) => b.name.localeCompare(a.name)).slice(13);
+  for (const f of old) trash(f.id).catch(() => {});
+  return true;
+}
+/** A copy kept just before a risky step (migration, restore, replace): hub/bassiet/backups/state-YYYY-MM-DD-before-<what>.json. */
+export async function backupBefore(root, state, what) {
+  const dir = await backupsDir(root);
+  const d = new Date(), p2 = (n) => String(n).padStart(2, '0');
+  await putJson(dir, `state-${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}-before-${what}-${p2(d.getHours())}${p2(d.getMinutes())}.json`, state);
+}
+export async function listBackups(root) {
+  const dir = await backupsDir(root, false); if (!dir) return [];
+  return (await list(dir, { extra: "name contains 'state-'" })).sort((a, b) => b.name.localeCompare(a.name)).map(f => ({ id: f.id, name: f.name, date: f.name.slice(6, 16), size: +f.size || 0 }));
+}
+export async function readBackup(id) { return readJsonFile({ id }); }
+
+
+// ════════════════════════════════════════ Bassiet additions
+/** Best effort for JSON cut off mid-way (from Sudachi's store.js). */
+export function salvageJSON(raw) {
+  if (typeof raw !== 'string' || raw[0] !== '{') return null;
+  const cuts = []; const stack = []; let inStr = false, esc = false;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (inStr) { if (esc) esc = false; else if (c === '\\') esc = true; else if (c === '"') inStr = false; continue; }
+    if (c === '"') inStr = true;
+    else if (c === '{' || c === '[') stack.push(c === '{' ? '}' : ']');
+    else if (c === '}' || c === ']') { stack.pop(); if (stack.length) cuts.push([i + 1, stack.slice().reverse().join('')]); }
+    else if (c === ',') cuts.push([i, stack.slice().reverse().join('')]);
+  }
+  for (let n = cuts.length - 1, tries = 0; n >= 0 && tries < 60; n--, tries++) {
+    const [at, close] = cuts[n];
+    try { const s = JSON.parse(raw.slice(0, at) + close); if (s && typeof s === 'object') return s; } catch {}
+  }
+  return null;
+}
+export const ownFolder = (root) => meDir(root);
+/** Plates: image files in <own folder>/plates, by asset id. */
+export async function uploadBlob(root, name, blob) {
+  const dir = await childFolder(await meDir(root), 'plates', true);
+  const { file } = await findFile(dir, name); if (file) return file.id;
+  const boundary = 'bassiet' + Date.now().toString(36);
+  const meta = { name, parents: [dir], mimeType: blob.type || 'application/octet-stream' };
+  const body = new Blob([`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(meta)}\r\n--${boundary}\r\nContent-Type: ${meta.mimeType}\r\n\r\n`, blob, `\r\n--${boundary}--`]);
+  const r = await gfetch(`${UPLOAD}/files?uploadType=multipart&fields=id`, { method: 'POST', headers: { 'Content-Type': `multipart/related; boundary=${boundary}` }, body, timeout: 120000 });
+  stats.bytesUp += blob.size || 0; return r.id;
+}
+export async function downloadBlob(root, name) {
+  const dir = await childFolder(await meDir(root), 'plates', false); if (!dir) return null;
+  const { file } = await findFile(dir, name); if (!file) return null;
+  const buf = await downloadFile(file.id); return new Blob([buf], { type: file.mimeType || 'image/jpeg' });
+}
+export async function deleteBlob(root, name) {
+  const dir = await childFolder(await meDir(root), 'plates', false); if (!dir) return;
+  const { file, twins } = await findFile(dir, name); for (const f of [file, ...twins]) if (f) await trash(f.id).catch(() => {});
+}
+/** Stand-ins for the three claude.ai Drive connector tools the app calls (search_files, create_file, trash_file), so
+ *  "Send to Citrus" and "Send misses to Yuzu" work on the website too. Only the query forms the app uses are translated. */
+export async function connectorTool(tool, a = {}) {
+  if (tool === 'search_files') {
+    let qy = String(a.query || '').replace(/\btitle\s*=/g, 'name =').replace(/\btitle\s+contains/g, 'name contains')
+      .replace(/parentId\s*=\s*'([^']+)'/g, "'$1' in parents");
+    const p = new URLSearchParams({ q: qy, fields: 'files(id,name,mimeType,parents,createdTime,modifiedTime,trashed)', pageSize: String(a.pageSize || 50), spaces: 'drive' });
+    const j = await gfetch(`${DRIVE}/files?${p}`);
+    return { payload: { files: (j.files || []).map(f => ({ id: f.id, title: f.name, mimeType: f.mimeType, parentId: (f.parents || [])[0] || '', createdTime: f.createdTime, modifiedTime: f.modifiedTime, trashed: !!f.trashed })) } };
+  }
+  if (tool === 'create_file') {
+    const boundary = 'bassiet' + Date.now().toString(36);
+    const meta = { name: a.title, parents: a.parentId ? [a.parentId] : undefined, mimeType: a.contentMimeType || 'application/octet-stream' };
+    const payload = `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(meta)}\r\n--${boundary}\r\nContent-Type: ${meta.mimeType}\r\n\r\n${a.textContent || ''}\r\n--${boundary}--`;
+    const r = await gfetch(`${UPLOAD}/files?uploadType=multipart&fields=id,name`, { method: 'POST', headers: { 'Content-Type': `multipart/related; boundary=${boundary}` }, body: payload });
+    return { payload: { id: r.id, title: r.name } };
+  }
+  if (tool === 'trash_file') { await trash(a.fileId); return { payload: {} }; }
+  throw Object.assign(new Error('not_in_manifest'), { code: 'not_in_manifest' });
+}
+/** The Yuzu inbox (yuzu-data folder by tag, then collection/inbox inside it; else the old path). null if none. */
+export async function yuzuInbox(root) {
+  const t = await findTagged('yuzu-data');
+  const base = t || await ensurePath([root, 'Yuzu'], { create: false });
+  if (!base) return null;
+  const col = await childFolder(base, 'collection', false); if (!col) return null;
+  return childFolder(col, 'inbox', false);
+}

@@ -665,6 +665,17 @@ details.inst>summary .mono{font-size:12px;letter-spacing:.08em}
 /* figure live caption for screen readers (figs.js) */
 .fsr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);clip-path:inset(50%);white-space:nowrap;margin:0}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+
+/* website mode: the cloud button and its sheet (web/shim.js) */
+.cloudbtn{margin-left:auto;font:600 12px/1 var(--mono,monospace);padding:8px 10px;min-height:36px;border:2px solid var(--line);border-radius:4px;background:var(--surface);color:var(--text);cursor:pointer}
+.cloudbtn[data-state="ok"]{color:var(--accent-text,var(--accent))}
+.cloudbtn[data-state="error"],.cloudbtn[data-state="tap"]{border-color:var(--accent)}
+.cloudsheet{max-width:520px;width:calc(100% - 32px);border:2px solid var(--line);border-radius:4px;background:var(--surface);color:var(--text);padding:18px}
+.cloudsheet::backdrop{background:rgba(0,0,0,.6)}
+.cloudsheet h2{margin:0 0 8px}
+.cloudrow{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
+.cloudrow button{min-height:44px;padding:0 14px;border:2px solid var(--line);border-radius:4px;background:var(--bg);color:var(--text);cursor:pointer}
+.cloudrow button[data-c="connect"]{background:var(--accent);color:#111;border-color:var(--accent)}
 </style>
 <style id="fonts">/* Inline subset fonts (OFL: Pixelify Sans, Source Sans 3, JetBrains Mono from github.com/google/fonts),
    subset with fontTools to the characters this app uses, so the pixel headings survive offline and in the PWA (t09-33/t10-14). */
@@ -701,6 +712,7 @@ add('meta',{name:'apple-mobile-web-app-title',content:'Bassiet'});
 if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js',{scope:'./'}).catch(function(){});
 }catch(e){}})();
 </script>
+<script src="web/boot.js"></script>
 <script src="bank1.js"></script>
 <script src="bank2.js"></script>
 <script src="bank3.js"></script>

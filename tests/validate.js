@@ -1,5 +1,5 @@
 global.window=global;
-const dir=require('path').resolve(process.argv[2]||require('path').resolve(__dirname,'../app'));
+const dir=require('path').resolve(process.argv[2]||require('path').resolve(__dirname,'../docs'));
 const fs=require("fs");for (const f of [...fs.readFileSync(dir+"/index.html","utf8").matchAll(/<script src="(bank[^"]+)"/g)].map(m=>m[1])) if(fs.existsSync(dir+"/"+f)) require(dir+"/"+f);
 const B=global.BANK, ids=new Set(B.C.map(c=>c.id));
 const SYS=["General","Cardio","Resp","Renal","GI & liver","Blood & cancer","Endocrine","Repro","Neuro","MSK & skin","Immune"];

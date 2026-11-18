@@ -1,7 +1,7 @@
-const __APP=process.env.APP_DIR||require('path').resolve(__dirname,'../app');
+const __APP=process.env.APP_DIR||require('path').resolve(__dirname,'../docs');
 // D02 storage tests against t10's async mock db. Usage: NODE_PATH=$(npm root -g) node d02test.js [tree] [scenario]
 const {chromium}=require('playwright');
-const baseMock=require('../work-t10/mock.js');
+const baseMock=require('./mock.js');
 const TREE=process.argv[2]||__APP;
 const U='file://'+TREE+'/index.html';
 const which=process.argv[3]||'all';
@@ -88,7 +88,7 @@ if(run('D')){ // failed write: resolves false, rolls back, error toast
 if(run('D2')){ // unavailable is retried once
   const {p,ctx,errs}=await page({},'#today');
   await p.waitForTimeout(400);
-  const r=await p.evaluate(async()=>{var n=0;var real=CT.db;CT.db={collection:function(c){var col=real.collection(c);return {doc:function(id){var d=col.doc(id);return {set:function(o){n++;if(n===1)return Promise.reject({code:'unavailable'});return d.set(o)},delete:function(){return d.delete()}}}}}};
+  const r=await p.evaluate(async()=>{var n=0;var real=CT.db;CT.db={collection:function(c){var col=real.collection(c);return {doc:function(id){var d=col.doc(id);return {set:function(o){if(id!=='zz')return d.set(o);n++;if(n===1)return Promise.reject({code:'unavailable'});return d.set(o)},delete:function(){return d.delete()}}}}}};
     var v=await CT.setDoc('notes','zz',{note:'x'});CT.db=real;return {v,n}});
   ok('D2 retry once on unavailable',r.v===true&&r.n===2,r);await ctx.close();
 }
