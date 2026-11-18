@@ -1,0 +1,18 @@
+global.window=global;
+const dir=require('path').resolve(process.argv[2]||require('path').resolve(__dirname,'../app'));
+const fs=require("fs");for (const f of [...fs.readFileSync(dir+"/index.html","utf8").matchAll(/<script src="(bank[^"]+)"/g)].map(m=>m[1])) if(fs.existsSync(dir+"/"+f)) require(dir+"/"+f);
+const B=global.BANK, ids=new Set(B.C.map(c=>c.id));
+const SYS=["General","Cardio","Resp","Renal","GI & liver","Blood & cancer","Endocrine","Repro","Neuro","MSK & skin","Immune"];
+const LK=["path","micro","pharm","bio","phys"]; let bad=[];
+if(ids.size!==B.C.length) bad.push("dup concept ids");
+B.C.forEach(c=>{ if(!SYS.includes(c.s)) bad.push("sys "+c.id+" "+c.s); Object.keys(c.L).forEach(k=>{if(!LK.includes(k))bad.push("lens "+c.id+" "+k)}); if(!Object.keys(c.L).length) bad.push("nolens "+c.id)});
+B.E.forEach(e=>{ if(!ids.has(e[0])||!ids.has(e[1])) bad.push("edge "+e.join("|")); });
+const all=[...B.CH,...B.PT,...B.CP]; const iid=new Set(all.map(x=>x.id)); if(iid.size!==all.length) bad.push("dup item ids");
+all.forEach(x=>{ if(!SYS.includes(x.sys)) bad.push("itemsys "+x.id); (x.c||[]).forEach(c=>{if(!ids.has(c))bad.push("item concept "+x.id+" "+c)}); (x.sub||[]).forEach(s=>{if(!LK.includes(s))bad.push("sub "+x.id)});});
+B.CH.forEach(x=>{ if(x.steps.length<4||x.steps.length>7) bad.push("steps "+x.id+" "+x.steps.length)});
+B.CP.forEach(x=>x.rows.forEach(r=>{ if(r.length!==x.cols.length+1) bad.push("cprow "+x.id+" "+r[0])}));
+B.PT.forEach(x=>x.p.forEach(p=>{ if(!["u","d","n"].includes(p[1])) bad.push("dir "+x.id)}));
+console.log("concepts",B.C.length,"edges",B.E.length,"chains",B.CH.length,"predict",B.PT.length,"compare",B.CP.length);
+console.log(bad.length?bad.join("\n"):"content OK");
+const deg={}; B.E.forEach(e=>{deg[e[0]]=(deg[e[0]]||0)+1;deg[e[1]]=(deg[e[1]]||0)+1}); console.log("isolated:",B.C.filter(c=>!deg[c.id]).map(c=>c.id).join(",")||"none");
+const bySys={}; B.C.forEach(c=>bySys[c.s]=(bySys[c.s]||0)+1); console.log(JSON.stringify(bySys));

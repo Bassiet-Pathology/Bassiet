@@ -1,0 +1,15 @@
+const __APP=process.env.APP_DIR||require('path').resolve(__dirname,'../app');
+const {chromium}=require('playwright');const {spawn}=require('child_process');
+(async()=>{const srv=spawn('python3',['-m','http.server','8765','--bind','127.0.0.1'],{cwd:__APP,stdio:'ignore'});
+await new Promise(r=>setTimeout(r,800));
+const b=await chromium.launch();const ctx=await b.newContext();const p=await ctx.newPage();const errs=[];p.on('pageerror',e=>errs.push(e.message));
+await p.goto('http://127.0.0.1:8765/');await p.waitForTimeout(2500);
+const r=await p.evaluate(async()=>{var reg=await navigator.serviceWorker.getRegistration();var ks=await caches.keys();var out={};for(const k of ks){out[k]=(await (await caches.open(k)).keys()).length}return {active:!!(reg&&reg.active),ctrl:!!navigator.serviceWorker.controller,caches:out}});
+console.log('online',JSON.stringify(r));
+await ctx.setOffline(true);
+await p.reload();await p.waitForTimeout(1500);
+console.log('offline reload',JSON.stringify(await p.evaluate(()=>({h1:(document.querySelector('#main h1')||{}).textContent,title:document.title,ctrl:!!navigator.serviceWorker.controller}))),errs.slice(0,3));
+const p2=await ctx.newPage();await p2.goto('http://127.0.0.1:8765/index.html').catch(e=>console.log('idx err',e.message));await p2.waitForTimeout(800);
+console.log('offline index.html',await p2.evaluate(()=>!!document.querySelector('#main h1')).catch(e=>e.message));
+const m=await (await fetch('http://127.0.0.1:8765/manifest.json')).json().catch(()=>null);
+await b.close();srv.kill();})();
